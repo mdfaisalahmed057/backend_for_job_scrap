@@ -6,3 +6,4 @@ google-generativeai
 requests
 beautifulsoup4
 gunicorn
+python-dotenv
