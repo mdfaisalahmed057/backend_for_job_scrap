@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 import random
 from flask_cors import CORS
 import hashlib
+import psutil
 
 from concurrent.futures import ThreadPoolExecutor
 import logging
@@ -28,8 +29,7 @@ if not api_key:
 
 genai.configure(api_key=api_key)
 CORS(app)  # Enables CORS for all routes
-
-
+ 
 
 # User agent rotation to avoid being blocked
 USER_AGENTS = [
@@ -47,13 +47,12 @@ DEFAULT_JOB_PORTALS = {
 }
 
 # Rate limiting settings
-MIN_REQUEST_INTERVAL = 1  # Minimum seconds between requests to same domain
-MAX_CONCURRENT_REQUESTS = 5  # Maximum number of concurrent requests
+MIN_REQUEST_INTERVAL = 2  # Increased to 2 seconds between requests
+MAX_CONCURRENT_REQUESTS = 3  # Reduced to 3 to be more respectful
 
 # Memory monitoring
 def get_memory_usage():
     """Get current memory usage in MB"""
-    import psutil
     process = psutil.Process()
     return process.memory_info().rss / (1024 * 1024)  # Convert to MB
 
@@ -61,6 +60,7 @@ class JobScraper:
     def __init__(self):
         self.session = requests.Session()
         self.last_request_time = {}  # Track last request time per domain
+        self.failed_requests = []  # Track failed requests
         
     def get_random_user_agent(self):
         """Return a random user agent from the list."""
@@ -83,13 +83,42 @@ class JobScraper:
             'User-Agent': self.get_random_user_agent(),
             'Accept': 'text/html,application/xhtml+xml,application/xml',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.google.com/'
+            'Referer': 'https://www.google.com/',
+            'Connection': 'keep-alive',
+            'Cache-Control': 'max-age=0'
         }
         try:
-            response = self.session.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
+            response = self.session.get(url, headers=headers, timeout=15)
+            status_code = response.status_code
+            
+            if status_code == 403:
+                # Return information about the forbidden URL
+                self.failed_requests.append({
+                    'url': url,
+                    'status': 403,
+                    'message': 'Forbidden - Access denied',
+                    'portal': domain
+                })
+                return {'forbidden': True, 'url': url, 'domain': domain}
+            
+            if status_code != 200:
+                self.failed_requests.append({
+                    'url': url,
+                    'status': status_code,
+                    'message': f'HTTP error {status_code}',
+                    'portal': domain
+                })
+                return None
+                
             return response.text
         except requests.exceptions.RequestException as e:
+            error_message = str(e)
+            self.failed_requests.append({
+                'url': url,
+                'status': 'error',
+                'message': error_message,
+                'portal': domain
+            })
             print(f"Error fetching {url}: {e}")
             return None
     
@@ -97,29 +126,29 @@ class JobScraper:
         """Parse job data from Indeed."""
         try:
             job_data = {}
-            title_elem = job_element.select_one('h2.jobTitle')
+            # Updated Indeed selectors based on more recent Indeed structure
+            title_elem = job_element.select_one('.jcs-JobTitle') or job_element.select_one('h2.jobTitle')
             job_data['job_title'] = title_elem.get_text().strip() if title_elem else "N/A"
             
-            company_elem = job_element.select_one('span.companyName')
+            company_elem = job_element.select_one('.companyName') or job_element.select_one('span[data-testid="company-name"]')
             job_data['company'] = company_elem.get_text().strip() if company_elem else "N/A"
             
-            location_elem = job_element.select_one('div.companyLocation')
+            location_elem = job_element.select_one('.companyLocation') or job_element.select_one('div[data-testid="text-location"]')
             job_data['location'] = location_elem.get_text().strip() if location_elem else "N/A"
             
-            job_link = job_element.select_one('a.jcs-JobTitle')
+            job_link = job_element.select_one('a.jcs-JobTitle') or job_element.select_one('a[data-jk]')
             if job_link and job_link.get('href'):
                 job_data['application_link'] = urljoin('https://www.indeed.com', job_link.get('href'))
             else:
                 job_data['application_link'] = "N/A"
             
-            date_elem = job_element.select_one('span.date')
+            date_elem = job_element.select_one('span.date') or job_element.select_one('span[data-testid="job-age"]')
             job_data['posting_date'] = date_elem.get_text().strip() if date_elem else "N/A"
             
             job_data['job_type'] = self.extract_job_type(job_element)
             job_data['required_skills'] = []  # Placeholder – would require extra parsing
             job_data['job_description'] = "Visit job page for full description"
             job_data['salary_range'] = self.extract_salary(job_element)
-            job_data['cover_letter'] = self.generate_cover_letter(job_data)
             job_data['status'] = "Pending"
             
             return job_data
@@ -131,26 +160,26 @@ class JobScraper:
         """Parse job data from LinkedIn."""
         try:
             job_data = {}
-            title_elem = job_element.select_one('h3.base-search-card__title')
+            # Updated LinkedIn selectors based on more recent LinkedIn structure
+            title_elem = job_element.select_one('.base-search-card__title') or job_element.select_one('.job-card-list__title')
             job_data['job_title'] = title_elem.get_text().strip() if title_elem else "N/A"
             
-            company_elem = job_element.select_one('h4.base-search-card__subtitle')
+            company_elem = job_element.select_one('.base-search-card__subtitle') or job_element.select_one('.job-card-container__company-name')
             job_data['company'] = company_elem.get_text().strip() if company_elem else "N/A"
             
-            location_elem = job_element.select_one('span.job-search-card__location')
+            location_elem = job_element.select_one('.job-search-card__location') or job_element.select_one('.job-card-container__metadata-item')
             job_data['location'] = location_elem.get_text().strip() if location_elem else "N/A"
             
-            job_link = job_element.select_one('a.base-card__full-link')
+            job_link = job_element.select_one('a.base-card__full-link') or job_element.select_one('.job-card-container__link')
             job_data['application_link'] = job_link.get('href') if job_link else "N/A"
             
-            date_elem = job_element.select_one('time.job-search-card__listdate')
+            date_elem = job_element.select_one('.job-search-card__listdate') or job_element.select_one('time')
             job_data['posting_date'] = date_elem.get('datetime') if date_elem and date_elem.get('datetime') else "N/A"
             
             job_data['job_type'] = "N/A"  # Placeholder – additional details may be needed
             job_data['required_skills'] = []  # Placeholder
             job_data['job_description'] = "Visit job page for full description"
             job_data['salary_range'] = "N/A"  # Placeholder
-            job_data['cover_letter'] = self.generate_cover_letter(job_data)
             job_data['status'] = "Pending"
             
             return job_data
@@ -162,16 +191,17 @@ class JobScraper:
         """Parse job data from Glassdoor."""
         try:
             job_data = {}
-            title_elem = job_element.select_one('a.jobLink')
+            # Updated Glassdoor selectors based on more recent Glassdoor structure
+            title_elem = job_element.select_one('.jobLink') or job_element.select_one('.job-title')
             job_data['job_title'] = title_elem.get_text().strip() if title_elem else "N/A"
             
-            company_elem = job_element.select_one('div.empleyer-name')
+            company_elem = job_element.select_one('.employerName') or job_element.select_one('.employer-name')
             job_data['company'] = company_elem.get_text().strip() if company_elem else "N/A"
             
-            location_elem = job_element.select_one('span.location')
+            location_elem = job_element.select_one('.location') or job_element.select_one('.job-location')
             job_data['location'] = location_elem.get_text().strip() if location_elem else "N/A"
             
-            job_link = job_element.select_one('a.jobLink')
+            job_link = job_element.select_one('a.jobLink') or job_element.select_one('a.job-link')
             job_data['application_link'] = urljoin('https://www.glassdoor.com', job_link.get('href')) if job_link else "N/A"
             
             job_data['job_type'] = "N/A"
@@ -179,7 +209,6 @@ class JobScraper:
             job_data['job_description'] = "Visit job page for full description"
             job_data['salary_range'] = "N/A"
             job_data['posting_date'] = "N/A"
-            job_data['cover_letter'] = self.generate_cover_letter(job_data)
             job_data['status'] = "Pending"
             
             return job_data
@@ -196,8 +225,6 @@ class JobScraper:
                 job_data[field] = elem.get_text().strip() if elem else "N/A"
             if 'required_skills' not in job_data:
                 job_data['required_skills'] = []
-            if 'cover_letter' not in job_data:
-                job_data['cover_letter'] = self.generate_cover_letter(job_data)
             if 'status' not in job_data:
                 job_data['status'] = "Pending"
             return job_data
@@ -216,7 +243,7 @@ class JobScraper:
     
     def extract_salary(self, job_element):
         """Extract salary information from job element."""
-        salary_elem = job_element.select_one('div.salary-snippet')
+        salary_elem = job_element.select_one('.salary-snippet') or job_element.select_one('[data-testid="salary-estimate"]')
         if salary_elem:
             return salary_elem.get_text().strip()
         job_text = job_element.get_text()
@@ -226,32 +253,10 @@ class JobScraper:
             return salary_match.group(0)
         return "N/A"
     
-    def generate_cover_letter(self, job_data):
-        """Generate a generic cover letter template based on job data."""
-        company = job_data.get('company', 'the company')
-        title = job_data.get('job_title', 'the position')
-        skills = ", ".join(job_data.get('required_skills', [])) if job_data.get('required_skills') else "my relevant skills"
-        cover_letter = f"""Dear Hiring Manager,
-
-I am excited to apply for the {title} role at {company}. With my experience in {skills}, I am confident in my ability to contribute effectively to your team.
-
-I look forward to discussing how my skills align with your needs for the {title} position.
-
-Best regards,
-[Your Name]"""
-        return cover_letter
     
-    def extract_skills_from_description(self, description):
-        """Extract potential skills from job description."""
-        common_skills = [
-            "Python", "JavaScript", "React", "Angular", "Vue", "Node.js",
-            "Java", "C#", ".NET", "AWS", "Azure", "Google Cloud",
-            "Docker", "Kubernetes", "SQL", "NoSQL", "MongoDB",
-            "REST API", "GraphQL", "Machine Learning", "AI"
-        ]
-        found_skills = [skill for skill in common_skills if skill.lower() in description.lower()]
-        return found_skills if found_skills else []
-    
+
+
+
     def scrape_jobs(self, role, skills, location, num_jobs=10, custom_urls=None):
         """Scrape jobs from multiple sources based on role, skills, and location."""
         all_jobs = []
@@ -300,93 +305,102 @@ Best regards,
                     print("Memory usage too high, stopping job collection")
                     break
         
-        return all_jobs
+        # Include information about access-denied URLs
+        return {
+            'jobs': all_jobs,
+            'failed_requests': self.failed_requests
+        }
     
     def scrape_single_source(self, portal, url, max_jobs, skills_pattern, location_pattern):
         """Scrape a single job portal."""
         print(f"Scraping {portal}: {url}")
-        html = self.fetch_page(url)
-        if not html:
-            return []
+        html_response = self.fetch_page(url)
         
-        soup = BeautifulSoup(html, 'html.parser')
+        if not html_response:
+            return []
+            
+        # Handle forbidden URLs
+        if isinstance(html_response, dict) and html_response.get('forbidden'):
+            return []
+            
+        # Process HTML response
+        soup = BeautifulSoup(html_response, 'html.parser')
         jobs_found = []
         
         try:
-            jobs_by_portal = {
-                'indeed': self._get_indeed_jobs(soup),
-                'linkedin': self._get_linkedin_jobs(soup),
-                'glassdoor': self._get_glassdoor_jobs(soup)
+            # Updated selectors for job elements
+            job_elements_selectors = {
+                'indeed': ['div.job_seen_beacon', 'div.jobsearch-SerpJobCard', 'div[data-testid="job-card"]'],
+                'linkedin': ['div.base-search-card', 'li.jobs-search-results__list-item', 'div.job-card-container'],
+                'glassdoor': ['li.react-job-listing', 'div.jobCard', 'li.jl', 'article.jobCard']
             }
-            if portal in jobs_by_portal:
-                raw_jobs = jobs_by_portal[portal]
-            else:
-                raw_jobs = self._get_generic_jobs(soup, url)
             
-            # Filter jobs based on skills and location
-            for job in raw_jobs:
-                searchable_text = (
-                    job.get('job_title', '') + ' ' +
-                    job.get('job_description', '') + ' ' +
-                    ','.join(job.get('required_skills', []))
-                ).lower()
-                job_location = job.get('location', '').lower()
-                if (skills_pattern.search(searchable_text) and 
-                    (location_pattern.search(job_location) or job_location == "unknown")):
+            # Try multiple selectors for each portal
+            job_elements = []
+            if portal in job_elements_selectors:
+                for selector in job_elements_selectors[portal]:
+                    job_elements = soup.select(selector)
+                    if job_elements:
+                        print(f"Found {len(job_elements)} job elements with selector '{selector}' for {portal}")
+                        break
+            
+            # If no elements found with specific selectors, try generic selectors
+            if not job_elements:
+                job_elements = soup.select('div.job') or soup.select('div[class*="job"]') or soup.select('li[class*="job"]')
+                print(f"Using generic selectors, found {len(job_elements)} job elements for {portal}")
+            
+            # Parse jobs based on portal
+            if portal == 'indeed':
+                parse_func = self.parse_indeed_job
+            elif portal == 'linkedin':
+                parse_func = self.parse_linkedin_job
+            elif portal == 'glassdoor':
+                parse_func = self.parse_glassdoor_job
+            else:
+                parse_func = lambda elem: self.parse_generic_job(elem, {
+                    'job_title': 'h2, h3, .title, [class*="title"]',
+                    'company': 'span.company, div.company, [class*="company"]',
+                    'location': 'div.location, span.location, [class*="location"]',
+                    'posting_date': 'span.date, time, [class*="date"]'
+                })
+            
+            # Parse jobs
+            for elem in job_elements:
+                job = parse_func(elem)
+                if job:
                     jobs_found.append(job)
                     if len(jobs_found) >= max_jobs:
                         break
+            
+            # Store the raw HTML for debugging if no jobs found
+            if not jobs_found and job_elements:
+                print(f"Found elements but couldn't parse jobs for {portal}. First element: {job_elements[0]}")
+        
         except Exception as e:
+            self.failed_requests.append({
+                'url': url,
+                'status': 'parsing_error',
+                'message': str(e),
+                'portal': portal
+            })
             print(f"Error scraping {portal}: {e}")
         
-        jobs_found.sort(key=lambda x: x.get('job_title', ''))
         print(f"Found {len(jobs_found)} relevant jobs from {portal}")
         return jobs_found[:max_jobs]
-    
-    # Helper methods for portal-specific scraping
-    def _get_indeed_jobs(self, soup):
-        job_elements = soup.select('div.jobsearch-SerpJobCard')
-        jobs = []
-        for elem in job_elements:
-            job = self.parse_indeed_job(elem)
-            if job:
-                jobs.append(job)
-        return jobs
-    
-    def _get_linkedin_jobs(self, soup):
-        job_elements = soup.select('div.base-search-card')
-        jobs = []
-        for elem in job_elements:
-            job = self.parse_linkedin_job(elem)
-            if job:
-                jobs.append(job)
-        return jobs
-    
-    def _get_glassdoor_jobs(self, soup):
-        job_elements = soup.select('li.jl')  # Example selector; adjust as needed
-        jobs = []
-        for elem in job_elements:
-            job = self.parse_glassdoor_job(elem)
-            if job:
-                jobs.append(job)
-        return jobs
-    
-    def _get_generic_jobs(self, soup, url):
-        job_elements = soup.find_all('div', class_='job')  # Fallback generic selector
-        jobs = []
-        for elem in job_elements:
-            job = self.parse_generic_job(elem, {
-                'job_title': 'h2',
-                'company': 'span.company',
-                'location': 'div.location',
-                'posting_date': 'span.date'
-            })
-            if job:
-                jobs.append(job)
-        return jobs
 
-# Flask API endpoint
-
+def preprocess_with_llm(role, location, skills):
+    """
+    Use Gemini to preprocess and standardize job search inputs.
+    """
+    # For now, skip LLM processing and just return standard format
+    skills_list = skills if isinstance(skills, list) else [s.strip() for s in skills.split(',') if s.strip()]
+    
+    return {
+        "role": role,
+        "location": location.split(',')[0].strip() if isinstance(location, str) else location,
+        "skills": skills_list
+    }
+    
 @app.route('/api/jobs', methods=['POST'])
 def get_jobs():
     """API endpoint to get jobs based on criteria from POST payload."""
@@ -398,34 +412,57 @@ def get_jobs():
                 'required_fields': ['role', 'location'],
                 'optional_fields': ['skills', 'num_jobs', 'urls']
             }), 400
-        
-        role = payload.get('role')
-        location = payload.get('location')
-        skills = payload.get('skills', [])
+            
+        # Get raw inputs
+        raw_role = payload.get('role')
+        raw_location = payload.get('location')
+        raw_skills = payload.get('skills', [])
         num_jobs = payload.get('num_jobs', 10)
         custom_urls = payload.get('urls')
         
-        if not role or not location:
+        if not raw_role or not raw_location:
             return jsonify({
                 'error': 'Missing required fields in payload',
                 'required': ['role', 'location'],
                 'optional': ['skills', 'num_jobs', 'urls']
             }), 400
         
+        # Preprocess inputs
+        processed_data = preprocess_with_llm(raw_role, raw_location, raw_skills)
+        
+        role = processed_data['role']
+        location = processed_data['location']
+        skills = processed_data['skills']
+        
+        # Log the transformation for debugging
+        print(f"Original input: {raw_role}, {raw_location}, {raw_skills}")
+        print(f"Processed input: {role}, {location}, {skills}")
+        
         scraper = JobScraper()
-        jobs = scraper.scrape_jobs(role, skills, location, num_jobs, custom_urls)
+        result = scraper.scrape_jobs(role, skills, location, num_jobs, custom_urls)
+        
+        jobs = result.get('jobs', [])
+        failed_requests = result.get('failed_requests', [])
         
         return jsonify({
             'status': 'success',
             'count': len(jobs),
-            'jobs': jobs
+            'jobs': jobs,
+            'failed_requests': failed_requests,
+            'processed_query': {
+                'role': role,
+                'location': location,
+                'skills': skills
+            }
         })
     except Exception as e:
+        import traceback
+        stack_trace = traceback.format_exc()
         return jsonify({
             'status': 'error',
-            'message': str(e)
+            'message': str(e),
+            'stack_trace': stack_trace
         }), 500
-
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
