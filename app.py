@@ -11,25 +11,26 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, urljoin
 import time
-from dotenv import load_dotenv
 import random
 from flask_cors import CORS
-import hashlib
-import psutil
+from dotenv import load_dotenv
 
-from concurrent.futures import ThreadPoolExecutor
-import logging
-
+# Load environment variables from .env file
 load_dotenv()
+
 app = Flask(__name__)
-api_key = os.getenv("GEMINI_API_KEY")
 
-if not api_key:
-    raise ValueError("GEMINI_API_KEY environment variable is not set")
+# Configure Gemini API using environment variable
+gemini_api_key = os.environ.get("GEMINI_API_KEY")
+if gemini_api_key:
+    genai.configure(api_key=gemini_api_key)
+else:
+    print("Warning: GEMINI_API_KEY not found in environment.")
 
-genai.configure(api_key=api_key)
 CORS(app)  # Enables CORS for all routes
- 
+
+
+
 
 # User agent rotation to avoid being blocked
 USER_AGENTS = [
@@ -47,12 +48,13 @@ DEFAULT_JOB_PORTALS = {
 }
 
 # Rate limiting settings
-MIN_REQUEST_INTERVAL = 2  # Increased to 2 seconds between requests
-MAX_CONCURRENT_REQUESTS = 3  # Reduced to 3 to be more respectful
+MIN_REQUEST_INTERVAL = 1  # Minimum seconds between requests to same domain
+MAX_CONCURRENT_REQUESTS = 5  # Maximum number of concurrent requests
 
 # Memory monitoring
 def get_memory_usage():
     """Get current memory usage in MB"""
+    import psutil
     process = psutil.Process()
     return process.memory_info().rss / (1024 * 1024)  # Convert to MB
 
@@ -60,7 +62,6 @@ class JobScraper:
     def __init__(self):
         self.session = requests.Session()
         self.last_request_time = {}  # Track last request time per domain
-        self.failed_requests = []  # Track failed requests
         
     def get_random_user_agent(self):
         """Return a random user agent from the list."""
@@ -83,42 +84,13 @@ class JobScraper:
             'User-Agent': self.get_random_user_agent(),
             'Accept': 'text/html,application/xhtml+xml,application/xml',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.google.com/',
-            'Connection': 'keep-alive',
-            'Cache-Control': 'max-age=0'
+            'Referer': 'https://www.google.com/'
         }
         try:
-            response = self.session.get(url, headers=headers, timeout=15)
-            status_code = response.status_code
-            
-            if status_code == 403:
-                # Return information about the forbidden URL
-                self.failed_requests.append({
-                    'url': url,
-                    'status': 403,
-                    'message': 'Forbidden - Access denied',
-                    'portal': domain
-                })
-                return {'forbidden': True, 'url': url, 'domain': domain}
-            
-            if status_code != 200:
-                self.failed_requests.append({
-                    'url': url,
-                    'status': status_code,
-                    'message': f'HTTP error {status_code}',
-                    'portal': domain
-                })
-                return None
-                
+            response = self.session.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
             return response.text
         except requests.exceptions.RequestException as e:
-            error_message = str(e)
-            self.failed_requests.append({
-                'url': url,
-                'status': 'error',
-                'message': error_message,
-                'portal': domain
-            })
             print(f"Error fetching {url}: {e}")
             return None
     
@@ -126,29 +98,29 @@ class JobScraper:
         """Parse job data from Indeed."""
         try:
             job_data = {}
-            # Updated Indeed selectors based on more recent Indeed structure
-            title_elem = job_element.select_one('.jcs-JobTitle') or job_element.select_one('h2.jobTitle')
+            title_elem = job_element.select_one('h2.jobTitle')
             job_data['job_title'] = title_elem.get_text().strip() if title_elem else "N/A"
             
-            company_elem = job_element.select_one('.companyName') or job_element.select_one('span[data-testid="company-name"]')
+            company_elem = job_element.select_one('span.companyName')
             job_data['company'] = company_elem.get_text().strip() if company_elem else "N/A"
             
-            location_elem = job_element.select_one('.companyLocation') or job_element.select_one('div[data-testid="text-location"]')
+            location_elem = job_element.select_one('div.companyLocation')
             job_data['location'] = location_elem.get_text().strip() if location_elem else "N/A"
             
-            job_link = job_element.select_one('a.jcs-JobTitle') or job_element.select_one('a[data-jk]')
+            job_link = job_element.select_one('a.jcs-JobTitle')
             if job_link and job_link.get('href'):
                 job_data['application_link'] = urljoin('https://www.indeed.com', job_link.get('href'))
             else:
                 job_data['application_link'] = "N/A"
             
-            date_elem = job_element.select_one('span.date') or job_element.select_one('span[data-testid="job-age"]')
+            date_elem = job_element.select_one('span.date')
             job_data['posting_date'] = date_elem.get_text().strip() if date_elem else "N/A"
             
             job_data['job_type'] = self.extract_job_type(job_element)
             job_data['required_skills'] = []  # Placeholder – would require extra parsing
             job_data['job_description'] = "Visit job page for full description"
             job_data['salary_range'] = self.extract_salary(job_element)
+            job_data['cover_letter'] = self.generate_cover_letter(job_data)
             job_data['status'] = "Pending"
             
             return job_data
@@ -160,26 +132,26 @@ class JobScraper:
         """Parse job data from LinkedIn."""
         try:
             job_data = {}
-            # Updated LinkedIn selectors based on more recent LinkedIn structure
-            title_elem = job_element.select_one('.base-search-card__title') or job_element.select_one('.job-card-list__title')
+            title_elem = job_element.select_one('h3.base-search-card__title')
             job_data['job_title'] = title_elem.get_text().strip() if title_elem else "N/A"
             
-            company_elem = job_element.select_one('.base-search-card__subtitle') or job_element.select_one('.job-card-container__company-name')
+            company_elem = job_element.select_one('h4.base-search-card__subtitle')
             job_data['company'] = company_elem.get_text().strip() if company_elem else "N/A"
             
-            location_elem = job_element.select_one('.job-search-card__location') or job_element.select_one('.job-card-container__metadata-item')
+            location_elem = job_element.select_one('span.job-search-card__location')
             job_data['location'] = location_elem.get_text().strip() if location_elem else "N/A"
             
-            job_link = job_element.select_one('a.base-card__full-link') or job_element.select_one('.job-card-container__link')
+            job_link = job_element.select_one('a.base-card__full-link')
             job_data['application_link'] = job_link.get('href') if job_link else "N/A"
             
-            date_elem = job_element.select_one('.job-search-card__listdate') or job_element.select_one('time')
+            date_elem = job_element.select_one('time.job-search-card__listdate')
             job_data['posting_date'] = date_elem.get('datetime') if date_elem and date_elem.get('datetime') else "N/A"
             
             job_data['job_type'] = "N/A"  # Placeholder – additional details may be needed
             job_data['required_skills'] = []  # Placeholder
             job_data['job_description'] = "Visit job page for full description"
             job_data['salary_range'] = "N/A"  # Placeholder
+            job_data['cover_letter'] = self.generate_cover_letter(job_data)
             job_data['status'] = "Pending"
             
             return job_data
@@ -191,17 +163,16 @@ class JobScraper:
         """Parse job data from Glassdoor."""
         try:
             job_data = {}
-            # Updated Glassdoor selectors based on more recent Glassdoor structure
-            title_elem = job_element.select_one('.jobLink') or job_element.select_one('.job-title')
+            title_elem = job_element.select_one('a.jobLink')
             job_data['job_title'] = title_elem.get_text().strip() if title_elem else "N/A"
             
-            company_elem = job_element.select_one('.employerName') or job_element.select_one('.employer-name')
+            company_elem = job_element.select_one('div.empleyer-name')
             job_data['company'] = company_elem.get_text().strip() if company_elem else "N/A"
             
-            location_elem = job_element.select_one('.location') or job_element.select_one('.job-location')
+            location_elem = job_element.select_one('span.location')
             job_data['location'] = location_elem.get_text().strip() if location_elem else "N/A"
             
-            job_link = job_element.select_one('a.jobLink') or job_element.select_one('a.job-link')
+            job_link = job_element.select_one('a.jobLink')
             job_data['application_link'] = urljoin('https://www.glassdoor.com', job_link.get('href')) if job_link else "N/A"
             
             job_data['job_type'] = "N/A"
@@ -209,6 +180,7 @@ class JobScraper:
             job_data['job_description'] = "Visit job page for full description"
             job_data['salary_range'] = "N/A"
             job_data['posting_date'] = "N/A"
+            job_data['cover_letter'] = self.generate_cover_letter(job_data)
             job_data['status'] = "Pending"
             
             return job_data
@@ -225,6 +197,8 @@ class JobScraper:
                 job_data[field] = elem.get_text().strip() if elem else "N/A"
             if 'required_skills' not in job_data:
                 job_data['required_skills'] = []
+            if 'cover_letter' not in job_data:
+                job_data['cover_letter'] = self.generate_cover_letter(job_data)
             if 'status' not in job_data:
                 job_data['status'] = "Pending"
             return job_data
@@ -243,7 +217,7 @@ class JobScraper:
     
     def extract_salary(self, job_element):
         """Extract salary information from job element."""
-        salary_elem = job_element.select_one('.salary-snippet') or job_element.select_one('[data-testid="salary-estimate"]')
+        salary_elem = job_element.select_one('div.salary-snippet')
         if salary_elem:
             return salary_elem.get_text().strip()
         job_text = job_element.get_text()
@@ -253,10 +227,32 @@ class JobScraper:
             return salary_match.group(0)
         return "N/A"
     
+    def generate_cover_letter(self, job_data):
+        """Generate a generic cover letter template based on job data."""
+        company = job_data.get('company', 'the company')
+        title = job_data.get('job_title', 'the position')
+        skills = ", ".join(job_data.get('required_skills', [])) if job_data.get('required_skills') else "my relevant skills"
+        cover_letter = f"""Dear Hiring Manager,
+
+I am excited to apply for the {title} role at {company}. With my experience in {skills}, I am confident in my ability to contribute effectively to your team.
+
+I look forward to discussing how my skills align with your needs for the {title} position.
+
+Best regards,
+[Your Name]"""
+        return cover_letter
     
-
-
-
+    def extract_skills_from_description(self, description):
+        """Extract potential skills from job description."""
+        common_skills = [
+            "Python", "JavaScript", "React", "Angular", "Vue", "Node.js",
+            "Java", "C#", ".NET", "AWS", "Azure", "Google Cloud",
+            "Docker", "Kubernetes", "SQL", "NoSQL", "MongoDB",
+            "REST API", "GraphQL", "Machine Learning", "AI"
+        ]
+        found_skills = [skill for skill in common_skills if skill.lower() in description.lower()]
+        return found_skills if found_skills else []
+    
     def scrape_jobs(self, role, skills, location, num_jobs=10, custom_urls=None):
         """Scrape jobs from multiple sources based on role, skills, and location."""
         all_jobs = []
@@ -305,102 +301,93 @@ class JobScraper:
                     print("Memory usage too high, stopping job collection")
                     break
         
-        # Include information about access-denied URLs
-        return {
-            'jobs': all_jobs,
-            'failed_requests': self.failed_requests
-        }
+        return all_jobs
     
     def scrape_single_source(self, portal, url, max_jobs, skills_pattern, location_pattern):
         """Scrape a single job portal."""
         print(f"Scraping {portal}: {url}")
-        html_response = self.fetch_page(url)
+        html = self.fetch_page(url)
+        if not html:
+            return []
         
-        if not html_response:
-            return []
-            
-        # Handle forbidden URLs
-        if isinstance(html_response, dict) and html_response.get('forbidden'):
-            return []
-            
-        # Process HTML response
-        soup = BeautifulSoup(html_response, 'html.parser')
+        soup = BeautifulSoup(html, 'html.parser')
         jobs_found = []
         
         try:
-            # Updated selectors for job elements
-            job_elements_selectors = {
-                'indeed': ['div.job_seen_beacon', 'div.jobsearch-SerpJobCard', 'div[data-testid="job-card"]'],
-                'linkedin': ['div.base-search-card', 'li.jobs-search-results__list-item', 'div.job-card-container'],
-                'glassdoor': ['li.react-job-listing', 'div.jobCard', 'li.jl', 'article.jobCard']
+            jobs_by_portal = {
+                'indeed': self._get_indeed_jobs(soup),
+                'linkedin': self._get_linkedin_jobs(soup),
+                'glassdoor': self._get_glassdoor_jobs(soup)
             }
-            
-            # Try multiple selectors for each portal
-            job_elements = []
-            if portal in job_elements_selectors:
-                for selector in job_elements_selectors[portal]:
-                    job_elements = soup.select(selector)
-                    if job_elements:
-                        print(f"Found {len(job_elements)} job elements with selector '{selector}' for {portal}")
-                        break
-            
-            # If no elements found with specific selectors, try generic selectors
-            if not job_elements:
-                job_elements = soup.select('div.job') or soup.select('div[class*="job"]') or soup.select('li[class*="job"]')
-                print(f"Using generic selectors, found {len(job_elements)} job elements for {portal}")
-            
-            # Parse jobs based on portal
-            if portal == 'indeed':
-                parse_func = self.parse_indeed_job
-            elif portal == 'linkedin':
-                parse_func = self.parse_linkedin_job
-            elif portal == 'glassdoor':
-                parse_func = self.parse_glassdoor_job
+            if portal in jobs_by_portal:
+                raw_jobs = jobs_by_portal[portal]
             else:
-                parse_func = lambda elem: self.parse_generic_job(elem, {
-                    'job_title': 'h2, h3, .title, [class*="title"]',
-                    'company': 'span.company, div.company, [class*="company"]',
-                    'location': 'div.location, span.location, [class*="location"]',
-                    'posting_date': 'span.date, time, [class*="date"]'
-                })
+                raw_jobs = self._get_generic_jobs(soup, url)
             
-            # Parse jobs
-            for elem in job_elements:
-                job = parse_func(elem)
-                if job:
+            # Filter jobs based on skills and location
+            for job in raw_jobs:
+                searchable_text = (
+                    job.get('job_title', '') + ' ' +
+                    job.get('job_description', '') + ' ' +
+                    ','.join(job.get('required_skills', []))
+                ).lower()
+                job_location = job.get('location', '').lower()
+                if (skills_pattern.search(searchable_text) and 
+                    (location_pattern.search(job_location) or job_location == "unknown")):
                     jobs_found.append(job)
                     if len(jobs_found) >= max_jobs:
                         break
-            
-            # Store the raw HTML for debugging if no jobs found
-            if not jobs_found and job_elements:
-                print(f"Found elements but couldn't parse jobs for {portal}. First element: {job_elements[0]}")
-        
         except Exception as e:
-            self.failed_requests.append({
-                'url': url,
-                'status': 'parsing_error',
-                'message': str(e),
-                'portal': portal
-            })
             print(f"Error scraping {portal}: {e}")
         
+        jobs_found.sort(key=lambda x: x.get('job_title', ''))
         print(f"Found {len(jobs_found)} relevant jobs from {portal}")
         return jobs_found[:max_jobs]
+    
+    # Helper methods for portal-specific scraping
+    def _get_indeed_jobs(self, soup):
+        job_elements = soup.select('div.jobsearch-SerpJobCard')
+        jobs = []
+        for elem in job_elements:
+            job = self.parse_indeed_job(elem)
+            if job:
+                jobs.append(job)
+        return jobs
+    
+    def _get_linkedin_jobs(self, soup):
+        job_elements = soup.select('div.base-search-card')
+        jobs = []
+        for elem in job_elements:
+            job = self.parse_linkedin_job(elem)
+            if job:
+                jobs.append(job)
+        return jobs
+    
+    def _get_glassdoor_jobs(self, soup):
+        job_elements = soup.select('li.jl')  # Example selector; adjust as needed
+        jobs = []
+        for elem in job_elements:
+            job = self.parse_glassdoor_job(elem)
+            if job:
+                jobs.append(job)
+        return jobs
+    
+    def _get_generic_jobs(self, soup, url):
+        job_elements = soup.find_all('div', class_='job')  # Fallback generic selector
+        jobs = []
+        for elem in job_elements:
+            job = self.parse_generic_job(elem, {
+                'job_title': 'h2',
+                'company': 'span.company',
+                'location': 'div.location',
+                'posting_date': 'span.date'
+            })
+            if job:
+                jobs.append(job)
+        return jobs
 
-def preprocess_with_llm(role, location, skills):
-    """
-    Use Gemini to preprocess and standardize job search inputs.
-    """
-    # For now, skip LLM processing and just return standard format
-    skills_list = skills if isinstance(skills, list) else [s.strip() for s in skills.split(',') if s.strip()]
-    
-    return {
-        "role": role,
-        "location": location.split(',')[0].strip() if isinstance(location, str) else location,
-        "skills": skills_list
-    }
-    
+# Flask API endpoint
+
 @app.route('/api/jobs', methods=['POST'])
 def get_jobs():
     """API endpoint to get jobs based on criteria from POST payload."""
@@ -412,57 +399,34 @@ def get_jobs():
                 'required_fields': ['role', 'location'],
                 'optional_fields': ['skills', 'num_jobs', 'urls']
             }), 400
-            
-        # Get raw inputs
-        raw_role = payload.get('role')
-        raw_location = payload.get('location')
-        raw_skills = payload.get('skills', [])
+        
+        role = payload.get('role')
+        location = payload.get('location')
+        skills = payload.get('skills', [])
         num_jobs = payload.get('num_jobs', 10)
         custom_urls = payload.get('urls')
         
-        if not raw_role or not raw_location:
+        if not role or not location:
             return jsonify({
                 'error': 'Missing required fields in payload',
                 'required': ['role', 'location'],
                 'optional': ['skills', 'num_jobs', 'urls']
             }), 400
         
-        # Preprocess inputs
-        processed_data = preprocess_with_llm(raw_role, raw_location, raw_skills)
-        
-        role = processed_data['role']
-        location = processed_data['location']
-        skills = processed_data['skills']
-        
-        # Log the transformation for debugging
-        print(f"Original input: {raw_role}, {raw_location}, {raw_skills}")
-        print(f"Processed input: {role}, {location}, {skills}")
-        
         scraper = JobScraper()
-        result = scraper.scrape_jobs(role, skills, location, num_jobs, custom_urls)
-        
-        jobs = result.get('jobs', [])
-        failed_requests = result.get('failed_requests', [])
+        jobs = scraper.scrape_jobs(role, skills, location, num_jobs, custom_urls)
         
         return jsonify({
             'status': 'success',
             'count': len(jobs),
-            'jobs': jobs,
-            'failed_requests': failed_requests,
-            'processed_query': {
-                'role': role,
-                'location': location,
-                'skills': skills
-            }
+            'jobs': jobs
         })
     except Exception as e:
-        import traceback
-        stack_trace = traceback.format_exc()
         return jsonify({
             'status': 'error',
-            'message': str(e),
-            'stack_trace': stack_trace
+            'message': str(e)
         }), 500
+
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -498,6 +462,54 @@ def extract_resume_text(file_path):
         return None
 
 import json
+
+def call_gemini(prompt):
+    """Call Gemini using the google-generativeai SDK."""
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    response = model.generate_content(prompt)
+    if not response.text:
+        raise ValueError("Gemini returned empty response")
+    return response.text
+
+def call_groq(prompt, api_key):
+    """Call Groq API via direct HTTP request."""
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1
+    }
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    response.raise_for_status()
+    res_json = response.json()
+    if 'choices' in res_json and len(res_json['choices']) > 0:
+        return res_json['choices'][0]['message']['content']
+    raise ValueError(f"Unexpected Groq API response structure: {res_json}")
+
+def call_openrouter(prompt, api_key):
+    """Call OpenRouter API via direct HTTP request."""
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:10000",
+        "X-Title": "Search Jobs AI Backend"
+    }
+    payload = {
+        "model": "google/gemini-2.0-flash-001",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1
+    }
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    response.raise_for_status()
+    res_json = response.json()
+    if 'choices' in res_json and len(res_json['choices']) > 0:
+        return res_json['choices'][0]['message']['content']
+    raise ValueError(f"Unexpected OpenRouter API response structure: {res_json}")
 
 def get_structured_resume_data(text):
     prompt = f"""
@@ -556,19 +568,68 @@ def get_structured_resume_data(text):
     }}
     """
 
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    response = model.generate_content(prompt)
-    
-    # Clean up the response and extract just the JSON part
-    raw_text = response.text.strip()
+    raw_text = None
+    errors = []
+
+    # 1. Try Gemini
+    try:
+        print("Attempting resume extraction with Gemini...")
+        raw_text = call_gemini(prompt)
+    except Exception as e:
+        err_msg = f"Gemini failed: {str(e)}"
+        print(err_msg)
+        errors.append(err_msg)
+
+    # 2. Try Groq (if Gemini failed)
+    if not raw_text:
+        groq_api_key = os.environ.get("GROQ_API_KEY")
+        if groq_api_key:
+            try:
+                print("Attempting resume extraction with Groq...")
+                raw_text = call_groq(prompt, groq_api_key)
+            except Exception as e:
+                err_msg = f"Groq failed: {str(e)}"
+                print(err_msg)
+                errors.append(err_msg)
+        else:
+            print("Groq API key not found in environment, skipping Groq fallback.")
+            errors.append("Groq API key not found in environment.")
+
+    # 3. Try OpenRouter (if both Gemini and Groq failed)
+    if not raw_text:
+        openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
+        if openrouter_api_key:
+            try:
+                print("Attempting resume extraction with OpenRouter...")
+                raw_text = call_openrouter(prompt, openrouter_api_key)
+            except Exception as e:
+                err_msg = f"OpenRouter failed: {str(e)}"
+                print(err_msg)
+                errors.append(err_msg)
+        else:
+            print("OpenRouter API key not found in environment, skipping OpenRouter fallback.")
+            errors.append("OpenRouter API key not found in environment.")
+
+    # If all options failed
+    if not raw_text:
+        return {
+            "error": "All AI extraction attempts failed.",
+            "details": errors
+        }
+
+    raw_text = raw_text.strip()
     
     # Try to find JSON in the response by looking for balanced braces
     start_idx = raw_text.find('{')
     if start_idx == -1:
-        return {"error": "Could not find JSON structure in the response"}
+        return {
+            "error": "Could not find JSON structure in the response",
+            "raw_response": raw_text[:200] + "..." if len(raw_text) > 200 else raw_text
+        }
     
     # Track opening and closing braces to find the complete JSON object
     open_braces = 0
+    json_str = None
     for i in range(start_idx, len(raw_text)):
         if raw_text[i] == '{':
             open_braces += 1
@@ -578,9 +639,12 @@ def get_structured_resume_data(text):
                 # We found the matching closing brace for the first opening brace
                 json_str = raw_text[start_idx:i+1]
                 break
-    else:
-        # If we didn't break out of the loop, we didn't find balanced braces
-        return {"error": "Unbalanced JSON structure in response"}
+    
+    if not json_str:
+        return {
+            "error": "Unbalanced JSON structure in response",
+            "raw_response": raw_text[:200] + "..." if len(raw_text) > 200 else raw_text
+        }
     
     # Try parsing the extracted JSON
     try:
@@ -592,6 +656,7 @@ def get_structured_resume_data(text):
             "error": f"JSON parsing failed: {str(e)}",
             "raw_response": raw_text[:100] + "..." if len(raw_text) > 100 else raw_text
         }
+
 
 @app.route("/extract_resume", methods=["POST"])
 def extract_resume():
@@ -608,31 +673,23 @@ def extract_resume():
     file_path = os.path.join(upload_dir, file.filename)
     file.save(file_path)
     
-    text = extract_resume_text(file_path)
-    if text is None:
-        return jsonify({"error": "Unsupported file format"}), 400
-    
-    structured_data = get_structured_resume_data(text)
-    
-    # Remove file after processing
-    os.remove(file_path)
-    
-    return jsonify(structured_data)
+    try:
+        text = extract_resume_text(file_path)
+        if text is None:
+            return jsonify({"error": "Unsupported file format"}), 400
+        
+        structured_data = get_structured_resume_data(text)
+        
+        # If there is an error in structured_data (i.e. all fallbacks failed)
+        if isinstance(structured_data, dict) and "error" in structured_data:
+            return jsonify(structured_data), 500
+            
+        return jsonify(structured_data)
+    finally:
+        # Always clean up the uploaded file
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
-    if "file" not in request.files:
-        return jsonify({"error": "No file provided"}), 400
-    
-    file = request.files["file"]
-    file_path = f"uploads/{file.filename}"
-    file.save(file_path)
-    
-    text = extract_resume_text(file_path)
-    if text is None:
-        return jsonify({"error": "Unsupported file format"}), 400
-    
-    structured_data = get_structured_resume_data(text)
-    os.remove(file_path)  # Clean up after processing
-    return jsonify(structured_data)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))  # Get port from environment, default to 10000
