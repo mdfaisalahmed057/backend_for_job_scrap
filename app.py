@@ -491,7 +491,6 @@ def call_groq(prompt, api_key):
     raise ValueError(f"Unexpected Groq API response structure: {res_json}")
 
 def call_openrouter(prompt, api_key):
-    """Call OpenRouter API via direct HTTP request."""
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -500,15 +499,19 @@ def call_openrouter(prompt, api_key):
         "X-Title": "Search Jobs AI Backend"
     }
     payload = {
-        "model": "google/gemini-2.0-flash-001",
+        "model": "google/gemini-2.5-flash",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1
     }
+
     response = requests.post(url, headers=headers, json=payload, timeout=30)
     response.raise_for_status()
     res_json = response.json()
-    if 'choices' in res_json and len(res_json['choices']) > 0:
-        return res_json['choices'][0]['message']['content']
+
+    choices = res_json.get("choices", [])
+    if choices:
+        return choices[0]["message"]["content"]
+
     raise ValueError(f"Unexpected OpenRouter API response structure: {res_json}")
 
 def get_structured_resume_data(text):
